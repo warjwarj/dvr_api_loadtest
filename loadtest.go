@@ -5,68 +5,164 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"time"
 
+	"github.com/gosuri/uilive"
 	"nhooyr.io/websocket"
 )
 
+type Aggregator struct {
+	writer                               *uilive.Writer
+	durTotal                             time.Duration
+	pingsTotal                           int
+	connRefusedTotal                     int
+	connAbortedTotal                     int
+	unrecognisedErrorTotal               int
+	deviceSuccessfullConnectionsTotal    int
+	APIclientSuccessfullConnectionsTotal int
+}
+
+func (ag *Aggregator) Init() {
+	ag.writer = uilive.New()
+	ag.writer.Start()
+}
+
+func (ag *Aggregator) printTotals() {
+	// printout to the screen
+	fmt.Fprintf(ag.writer, "dvr_api_loadtest\n")
+	fmt.Fprintf(ag.writer, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
+	fmt.Fprintf(ag.writer, "Pings: ....................................%v/%v\n", ag.pingsTotal, sampleSize)
+	fmt.Fprintf(ag.writer, "Connections refused: ......................%v\n", ag.connRefusedTotal)
+	fmt.Fprintf(ag.writer, "Connections aborted .......................%v\n", ag.connAbortedTotal)
+	fmt.Fprintf(ag.writer, "Unrecognised errors .......................%v\n", ag.unrecognisedErrorTotal)
+	fmt.Fprintf(ag.writer, "Successful device connections: ............%v/%v\n", ag.deviceSuccessfullConnectionsTotal, numClients)
+	fmt.Fprintf(ag.writer, "Successful API client connections: ........%v/%v\n", ag.APIclientSuccessfullConnectionsTotal, numClients)
+	fmt.Fprintf(ag.writer, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n")
+
+	// refresh the screen
+	ag.writer.Flush()
+}
+
 var (
-	GPSSvr     string = "192.168.1.127:9047"  // server addr
-	APISvr     string = "ws://127.0.0.1:9046" // server addr
-	numClients int    = 10                    // num of devs, num of API clients
-	sampleSize int    = 500                   // how many pings do we want.
+	GPSSvr           string = "192.168.1.77:9047"      // server addr
+	APISvr           string = "ws://192.168.1.77:9046" // server addr
+	numClients       int    = 100                      // num of devs, num of API clients
+	sampleSize       int    = 50000                    // how many pings do we want.
+	connInterlude_ms int    = 1                        // time between connection attempts in miliseconds
+
+	conn_refused string = "No connection could be made because the target machine actively refused it."
+	conn_aborted string = "An established connection was aborted by the software in your host machine."
 )
 
 func main() {
 
-	// setup
+	// data aggregator
+	ag := &Aggregator{}
+	ag.Init()
+	defer ag.writer.Stop()
+
+	// setup channels for data intake
 	durations := make(chan time.Duration, sampleSize)
-	//durationsLog := []time.Duration{}
+	errors := make(chan error)
+	deviceSuccessfullConnections := make(chan bool, numClients)
+	APIclientSuccessfullConnections := make(chan bool, numClients)
 
 	// cancel when we have enough data
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// create (numClients) mock devices & (numClients) mock API clients
-	for i := 0; i < numClients; i++ {
-		devId := rand.Intn(9000000000) + 1000000000
-		go mockDevice(ctx, devId)
-		go mockAPIClient(ctx, devId, durations)
-	}
+	// background so we see the devices connect in real time
+	go func() {
+		// create (numClients) mock devices & (numClients) mock API clients
+		for i := 0; i < numClients; i++ {
+			// gen rand dev id
+			devId := rand.Intn(9000000000) + 1000000000
 
-	// get enough datapoints
-	var durTotal time.Duration
+			// create our devices
+			go mockDevice(ctx, devId, errors, deviceSuccessfullConnections)
+			go mockAPIClient(ctx, devId, errors, APIclientSuccessfullConnections, durations)
+
+			// wait x amount of miliseconds
+			time.Sleep(time.Millisecond * time.Duration(connInterlude_ms))
+		}
+	}()
+
+	// label so we can break out of the loop
 AggregateData:
-	for range cap(durations) {
-		// use a select in case we want to add more channels
+	// loop over channels
+	for range sampleSize {
 		select {
-		case val, ok := <-durations:
+		// record ping times
+		case dur, ok := <-durations:
 			if ok {
-				durTotal += val
+				ag.durTotal += dur
+				ag.pingsTotal++
 			} else {
-				fmt.Println("Err receiving from durations chan, ceasing data aggregation")
+				fmt.Println("Fatal error receiving from durations chan, ceasing data aggregation")
+				break AggregateData
+			}
+		// record errors
+		case err, ok := <-errors:
+			if ok {
+				if strings.Contains(err.Error(), conn_refused) {
+					ag.connRefusedTotal++
+				} else if strings.Contains(err.Error(), conn_aborted) {
+					ag.connAbortedTotal++
+				} else {
+					ag.unrecognisedErrorTotal++
+				}
+			} else {
+				fmt.Println("Fatal error receiving from error channel, returning")
+				break AggregateData
+			}
+		// record successful conections devices
+		case _, ok := <-deviceSuccessfullConnections:
+			if ok {
+				ag.deviceSuccessfullConnectionsTotal++
+			} else {
+				fmt.Println("Fatal error receiving from dev connection counter chan, returning")
+				break AggregateData
+			}
+		// record successful connections API client
+		case _, ok := <-APIclientSuccessfullConnections:
+			if ok {
+				ag.APIclientSuccessfullConnectionsTotal++
+			} else {
+				fmt.Println("Fatal error receiving from API client connection counter chan, returning")
 				break AggregateData
 			}
 		}
-		fmt.Println()
+		ag.printTotals()
 	}
+
+	// cancel the context
 	cancel()
-	meanPing := durTotal / time.Duration(cap(durations))
+
+	ag.printTotals()
+
+	// mean server ping
+	meanPing := ag.durTotal / time.Duration(cap(durations))
 	fmt.Println("Mean server ping: ", meanPing)
 }
 
-func mockDevice(ctx context.Context, devId int) {
+func mockDevice(
+	ctx context.Context,
+	devId int,
+	errChan chan<- error,
+	successChan chan<- bool,
+) {
 	conn, err := net.Dial("tcp", GPSSvr)
 	if err != nil {
-		fmt.Printf("Simulated device %d: Error connecting to server: %v\n", devId, err)
+		errChan <- err
 		return
 	}
 	defer conn.Close()
 
-	fmt.Printf("Simulated device %d: Connected to server\n", devId)
+	successChan <- true
 	message := fmt.Sprintf("$ALV;%d;Hello Server!\r", devId)
 	_, err = conn.Write([]byte(message))
 	if err != nil {
-		fmt.Printf("Simulated device %d: Error sending message: %v\n", devId, err)
+		errChan <- err
 		return
 	}
 	buf := make([]byte, 256)
@@ -74,32 +170,35 @@ func mockDevice(ctx context.Context, devId int) {
 		// just echo recvd back
 		_, err := conn.Read(buf)
 		if err != nil {
-			fmt.Println("Err reading from connection in simulated device connection loop")
+			errChan <- err
 			return
 		}
 		_, err = conn.Write(buf)
 		if err != nil {
-			fmt.Println("Err writing to connection in simulated device connection loop")
+			errChan <- err
 			return
 		}
 	}
 }
 
-func mockAPIClient(ctx context.Context, targetDevice int, durations chan<- time.Duration) {
+func mockAPIClient(
+	ctx context.Context,
+	targetDevice int,
+	errChan chan<- error,
+	successChan chan<- bool,
+	durationsChan chan<- time.Duration,
+) {
 	// connect to server
 	conn, _, err := websocket.Dial(ctx, APISvr, nil)
 	if err != nil {
-		fmt.Printf("Error connecting mock API client to server: %v\n", err)
+		errChan <- err
 		return
 	}
 	defer func() {
-		fmt.Println("Closing API client connection")
+		//fmt.Println("Closing API client connection")
 		conn.Close(websocket.StatusNormalClosure, "")
 	}()
-	if err != nil {
-		fmt.Println("Error setting read deadline: ", err)
-	}
-	fmt.Printf("API client connected to server\n")
+	successChan <- true
 
 	// send + recv messages and calc ping
 	for {
@@ -108,18 +207,19 @@ func mockAPIClient(ctx context.Context, targetDevice int, durations chan<- time.
 		message := fmt.Sprintf("$MOCKCMD!;%v;sampletext\r", targetDevice)
 		err := conn.Write(ctx, websocket.MessageText, []byte(message))
 		if err != nil {
-			fmt.Printf("Err writing to connection in API client connection loop", err)
-			return
+			errChan <- err
 		}
 
 		// read ping response and calculate time diff
-		_, _, _ = conn.Read(ctx)
+		_, _, err = conn.Read(ctx)
+		if err != nil {
+			errChan <- err
+		}
 		after := time.Now()
 		difference := after.Sub(before)
 
-		// try insert diff value into chan
-		durations <- difference
-
+		// record ping and wait
+		durationsChan <- difference
 		time.Sleep(time.Millisecond * 10) // Adjust the interval between messages as needed
 	}
 }
