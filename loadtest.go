@@ -12,6 +12,17 @@ import (
 	"nhooyr.io/websocket"
 )
 
+var (
+	GPSSvr           string = "192.168.1.77:9047"      // server addr
+	APISvr           string = "ws://192.168.1.77:9046" // server addr
+	numClients       int    = 1000                     // num of devs, num of API clients
+	sampleSize       int    = 50000                    // how many pings do we want.
+	connInterlude_ms int    = 3                        // time between connection attempts in miliseconds
+
+	conn_refused string = "No connection could be made because the target machine actively refused it."
+	conn_aborted string = "An established connection was aborted by the software in your host machine."
+)
+
 type Aggregator struct {
 	writer                               *uilive.Writer
 	durTotal                             time.Duration
@@ -44,16 +55,16 @@ func (ag *Aggregator) printTotals() {
 	ag.writer.Flush()
 }
 
-var (
-	GPSSvr           string = "192.168.1.77:9047"      // server addr
-	APISvr           string = "ws://192.168.1.77:9046" // server addr
-	numClients       int    = 100                      // num of devs, num of API clients
-	sampleSize       int    = 50000                    // how many pings do we want.
-	connInterlude_ms int    = 1                        // time between connection attempts in miliseconds
+type Set map[string]struct{}
 
-	conn_refused string = "No connection could be made because the target machine actively refused it."
-	conn_aborted string = "An established connection was aborted by the software in your host machine."
-)
+func (s Set) Add(item string) {
+	s[item] = struct{}{}
+}
+
+func (s Set) Contains(item string) bool {
+	_, found := s[item]
+	return found
+}
 
 func main() {
 
@@ -61,6 +72,8 @@ func main() {
 	ag := &Aggregator{}
 	ag.Init()
 	defer ag.writer.Stop()
+
+	uniqueErrors := make(Set)
 
 	// setup channels for data intake
 	durations := make(chan time.Duration, sampleSize)
@@ -103,6 +116,9 @@ AggregateData:
 			}
 		// record errors
 		case err, ok := <-errors:
+			if !uniqueErrors.Contains(err.Error()) {
+				uniqueErrors.Add(err.Error())
+			}
 			if ok {
 				if strings.Contains(err.Error(), conn_refused) {
 					ag.connRefusedTotal++
@@ -138,11 +154,18 @@ AggregateData:
 	// cancel the context
 	cancel()
 
+	// update the console
 	ag.printTotals()
 
 	// mean server ping
 	meanPing := ag.durTotal / time.Duration(cap(durations))
 	fmt.Println("Mean server ping: ", meanPing)
+
+	// // print unique errors
+	// fmt.Println("Unique errors:")
+	// for i := range uniqueErrors {
+	// 	fmt.Println(i)
+	// }
 }
 
 func mockDevice(
