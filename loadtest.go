@@ -15,10 +15,11 @@ import (
 var (
 	GPSSvr           string = "192.168.1.77:9047"      // server addr
 	APISvr           string = "ws://192.168.1.77:9046" // server addr
-	numClients       int    = 1000                     // num of devs, num of API clients
-	sampleSize       int    = 50000                    // how many pings do we want.
-	connInterlude_ms int    = 3                        // time between connection attempts in miliseconds
+	numClients       int    = 10000                     // num of devs, num of API clients
+	sampleSize       int    = 5000000                    // how many pings do we want.
+	connInterlude_ms int    = 5                        // time between connection attempts in miliseconds
 
+  // match these strings to errors
 	conn_refused string = "No connection could be made because the target machine actively refused it."
 	conn_aborted string = "An established connection was aborted by the software in your host machine."
 )
@@ -103,7 +104,7 @@ func main() {
 	// label so we can break out of the loop
 AggregateData:
 	// loop over channels
-	for range sampleSize {
+	for pingsTotal != sampleSize {
 		select {
 		// record ping times
 		case dur, ok := <-durations:
