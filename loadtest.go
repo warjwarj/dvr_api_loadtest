@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -14,13 +16,28 @@ import (
 
 const (
 	// GLOBS
-	GPS_SVR           string = "192.168.1.127:9047"      // server addr
-	API_SVR           string = "ws://192.168.1.127:9046" // server addr
-	NUM_CLIENTS       int    = 10000                     // num of devs, num of API clients
-	SAMPLE_SIZE       int    = 5000000                   // how many pings to calc mean.
-	CONN_INTERLUDE_MS int    = 50                        // time between connection attempts in miliseconds
-	MSG_INTERLUDE_MS  int    = 10                        // time between pings in miliseconds
+	GPS_SVR           string = "127.0.0.1:9047"      // server addr
+	API_SVR           string = "ws://127.0.0.1:9046" // server addr
+	NUM_CLIENTS       int    = 20                    // num of devices and number of API clients
+	SAMPLE_SIZE       int    = 5000                  // how many pings to calc mean.
+	CONN_INTERLUDE_MS int    = 200                   // time between connection attempts in miliseconds
+	MSG_INTERLUDE_MS  int    = 100                   // time between pings in miliseconds
 )
+
+// API CLIENT SENDING MESSAGES TO SERVER
+type ApiReq_WS struct {
+	Messages            []string `json:"Messages"`
+	Subscriptions       []string `json:"Subscriptions"`
+	GetConnectedDevices bool     `json:"GetConnectedDevices"`
+}
+
+// API CLIENT RECEIVING MESSAGES FROM SERVER
+type ApiRes_WS struct {
+	RecvdTime  time.Time `json:"RecvdTime"`
+	PacketTime time.Time `json:"PacketTime"`
+	Message    string    `json:"Message"`
+	Direction  string    `json:"Direction"`
+}
 
 type Aggregator struct {
 	// write to the console
@@ -67,7 +84,6 @@ func (ag *Aggregator) printTotals() {
 	fmt.Fprintf(ag.writer, "Connections refused: ......................%v\n", ag.connRefusedTotal)
 	fmt.Fprintf(ag.writer, "Connections reset: ........................%v\n", ag.connResetTotal)
 	fmt.Fprintf(ag.writer, "Connections aborted .......................%v\n", ag.connAbortedTotal)
-	fmt.Fprintf(ag.writer, "Unrecognised errors .......................%v\n", ag.unrecognisedErrorTotal)
 	fmt.Fprintf(ag.writer, "Successful device connections: ............%v/%v\n", ag.deviceConnTotal, NUM_CLIENTS)
 	fmt.Fprintf(ag.writer, "Successful API client connections: ........%v/%v\n", ag.APIclientConnTotal, NUM_CLIENTS)
 	fmt.Fprintf(ag.writer, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
@@ -90,10 +106,12 @@ func main() {
 		// create (numClients) mock devices & (numClients) mock API clients
 		for i := 0; i < NUM_CLIENTS; i++ {
 			// not rand in case of duplicates
-			devId := 1000000000 + i*i
+			devId := strconv.Itoa(1000000 + i*i)
 
-			// create our devices
+			// connect mock dev
 			go mockDevice(ctx, devId, ag.connErrors, ag.devConns, ag.devDisconns)
+
+			// connect mock clientj
 			go mockAPIClient(ctx, devId, ag.connErrors, ag.APIcliConns, ag.APIcliDisconns, ag.pingVals)
 
 			// wait x amount of miliseconds
@@ -125,7 +143,7 @@ AggregateData:
 				} else if errors.Is(err, syscall.ECONNABORTED) {
 					ag.connAbortedTotal++
 				} else {
-					ag.unrecognisedErrorTotal++
+					fmt.Println(err)
 				}
 			} else {
 				fmt.Println("Fatal error receiving from error channel, returning")
@@ -177,7 +195,7 @@ AggregateData:
 
 func mockDevice(
 	ctx context.Context,
-	devId int,
+	devId string,
 	errChan chan<- error,
 	deviceConnections chan<- bool,
 	deviceDisconnections chan<- bool,
@@ -197,27 +215,28 @@ func mockDevice(
 			conn.Close()
 		}()
 
-		message := fmt.Sprintf("$ALV;%d;Hello Server!\r", devId)
+		// greet server, register prescence
+		message := []byte(fmt.Sprintf("$VIDEO;%v;20240817-123504;HiServer!\r", devId))
 		_, err = conn.Write([]byte(message))
-		if err != nil {
-			errChan <- err
-			deviceDisconnections <- true
-			break
-		}
+
+		// buf for io
 		buf := make([]byte, 256)
+
+		// conn loop
 		for {
 			// just echo recvd back
 			_, err := conn.Read(buf)
 			if err != nil {
 				errChan <- err
 				deviceDisconnections <- true
-				break
+				return
 			}
-			_, err = conn.Write(buf)
+
+			_, err = conn.Write(message)
 			if err != nil {
 				errChan <- err
 				deviceDisconnections <- true
-				break
+				return
 			}
 		}
 	}
@@ -225,7 +244,7 @@ func mockDevice(
 
 func mockAPIClient(
 	ctx context.Context,
-	targetDevice int,
+	targetDevice string,
 	errChan chan<- error,
 	APIClientConnections chan<- bool,
 	APIClientDisconnections chan<- bool,
@@ -234,7 +253,7 @@ func mockAPIClient(
 	for {
 		// connect to server, wait in case of reconnect
 		time.Sleep(time.Millisecond * time.Duration(CONN_INTERLUDE_MS))
-		conn, _, err := websocket.Dial(ctx, API_SVR, nil)
+		conn, _, err := websocket.Dial(ctx, API_SVR, &websocket.DialOptions{Subprotocols: []string{"dvr_api"}})
 		APIClientConnections <- true
 		if err != nil {
 			// record the error and the disconnection.
@@ -248,12 +267,31 @@ func mockAPIClient(
 			conn.Close(websocket.StatusNormalClosure, "")
 		}()
 
-		// send + recv messages and calc ping
+		// subscribe to the device we're assigned
+		req := ApiReq_WS{
+			Subscriptions: []string{targetDevice},
+		}
+		bytes, err := json.Marshal(req)
+		if err != nil {
+			fmt.Errorf("error mashalling into json %v")
+		}
+		err = conn.Write(ctx, websocket.MessageText, bytes)
+		if err != nil {
+			errChan <- err
+			APIClientDisconnections <- true
+			break
+		}
+
+		// add message to req
+		req.Messages = []string{fmt.Sprintf("$VIDEO;%v;all;4;20231003-164514;5", targetDevice)}
+
+		time.Sleep(time.Millisecond * time.Duration(MSG_INTERLUDE_MS))
+
+		// start conn loop communicating with device
 		for {
 			// send a ping, recording time before we sent it
 			before := time.Now()
-			message := fmt.Sprintf("$MOCKCMD!;%v;sampletext\r", targetDevice)
-			err := conn.Write(ctx, websocket.MessageText, []byte(message))
+			err := conn.Write(ctx, websocket.MessageText, bytes)
 			if err != nil {
 				errChan <- err
 				APIClientDisconnections <- true
