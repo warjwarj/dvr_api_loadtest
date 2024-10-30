@@ -18,9 +18,9 @@ const (
 	// GLOBS
 	GPS_SVR           string = "127.0.0.1:9047"      // server addr
 	API_SVR           string = "ws://127.0.0.1:9046" // server addr
-	NUM_CLIENTS       int    = 20                    // num of devices and number of API clients
-	SAMPLE_SIZE       int    = 5000                  // how many pings to calc mean.
-	CONN_INTERLUDE_MS int    = 200                   // time between connection attempts in miliseconds
+	NUM_CLIENTS       int    = 20000                 // num of devices and number of API clients
+	SAMPLE_SIZE       int    = 50000                 // how many pings to calc mean.
+	CONN_INTERLUDE_MS int    = 20                    // time between connection attempts in miliseconds
 	MSG_INTERLUDE_MS  int    = 100                   // time between pings in miliseconds
 )
 
@@ -270,22 +270,12 @@ func mockAPIClient(
 		// subscribe to the device we're assigned
 		req := ApiReq_WS{
 			Subscriptions: []string{targetDevice},
+			Messages:      []string{fmt.Sprintf("$VIDEO;%v;all;4;20231003-164514;5", targetDevice)},
 		}
 		bytes, err := json.Marshal(req)
 		if err != nil {
 			fmt.Errorf("error mashalling into json %v")
 		}
-		err = conn.Write(ctx, websocket.MessageText, bytes)
-		if err != nil {
-			errChan <- err
-			APIClientDisconnections <- true
-			break
-		}
-
-		// add message to req
-		req.Messages = []string{fmt.Sprintf("$VIDEO;%v;all;4;20231003-164514;5", targetDevice)}
-
-		time.Sleep(time.Millisecond * time.Duration(MSG_INTERLUDE_MS))
 
 		// start conn loop communicating with device
 		for {
